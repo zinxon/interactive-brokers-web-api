@@ -1,21 +1,100 @@
 import csv
 import io
+import xml.etree.ElementTree as ET
 import requests
 import time
 import os
 import random
-from flask import Flask, render_template, request, redirect, Response
+from flask import Flask, render_template, request, redirect, Response, abort
 
 # disable warnings until you install a certificate
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 BASE_API_URL = "https://localhost:5055/v1/api"
+FLEX_WEB_SERVICE_URL = "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService"
 ACCOUNT_ID = os.environ['IBKR_ACCOUNT_ID']
+FLEX_TOKEN = os.environ.get("IBKR_FLEX_TOKEN", "")
+FLEX_QUERY_ID = os.environ.get("IBKR_FLEX_QUERY_ID", "")
 
 os.environ['PYTHONHTTPSVERIFY'] = '0'
 
 app = Flask(__name__)
+
+FLEX_RETRY_ERROR_CODES = {
+    "1001", "1004", "1005", "1006", "1007", "1008", "1009",
+    "1019", "1021",
+}
+
+
+def flex_configured():
+    return bool(FLEX_TOKEN and FLEX_QUERY_ID)
+
+
+def _flex_xml_text(root, tag):
+    element = root.find(tag)
+    return element.text if element is not None else ""
+
+
+def fetch_flex_activity_statement(token, query_id, max_attempts=12, poll_interval=5):
+    headers = {"User-Agent": "ibkr-web-api-demo/1.0"}
+    send_response = requests.get(
+        f"{FLEX_WEB_SERVICE_URL}/SendRequest",
+        params={"t": token, "q": query_id, "v": 3},
+        headers=headers,
+        timeout=60,
+    )
+    send_response.raise_for_status()
+
+    send_root = ET.fromstring(send_response.text)
+    if _flex_xml_text(send_root, "Status") != "Success":
+        error_code = _flex_xml_text(send_root, "ErrorCode")
+        error_message = _flex_xml_text(send_root, "ErrorMessage")
+        raise RuntimeError(
+            f"Flex SendRequest failed ({error_code}): {error_message or 'Unknown error'}"
+        )
+
+    reference_code = _flex_xml_text(send_root, "ReferenceCode")
+    if not reference_code:
+        raise RuntimeError("Flex SendRequest did not return a reference code.")
+
+    for attempt in range(max_attempts):
+        if attempt:
+            time.sleep(poll_interval)
+
+        statement_response = requests.get(
+            f"{FLEX_WEB_SERVICE_URL}/GetStatement",
+            params={"t": token, "q": reference_code, "v": 3},
+            headers=headers,
+            timeout=120,
+        )
+        statement_response.raise_for_status()
+        content = statement_response.content
+
+        try:
+            statement_root = ET.fromstring(content)
+        except ET.ParseError:
+            return content
+
+        error_code = _flex_xml_text(statement_root, "ErrorCode")
+        if error_code:
+            if error_code in FLEX_RETRY_ERROR_CODES and attempt < max_attempts - 1:
+                continue
+            error_message = _flex_xml_text(statement_root, "ErrorMessage")
+            raise RuntimeError(
+                f"Flex GetStatement failed ({error_code}): {error_message or 'Unknown error'}"
+            )
+
+        return content
+
+    raise RuntimeError("Flex statement is still generating. Try again in a minute.")
+
+
+def flex_download_filename(content):
+    stripped = content.lstrip()
+    if stripped.startswith(b"<?xml") or stripped.startswith(b"<"):
+        return "activity_statement.xml", "application/xml"
+    return "activity_statement.csv", "text/csv"
 
 @app.template_filter('ctime')
 def timectime(s):
@@ -118,7 +197,11 @@ def portfolio():
         positions = []
 
     # return my positions, how much cash i have in this account
-    return render_template("portfolio.html", positions=positions)
+    return render_template(
+        "portfolio.html",
+        positions=positions,
+        flex_configured=flex_configured(),
+    )
 
 
 @app.route("/portfolio/csv")
@@ -157,6 +240,30 @@ def portfolio_csv():
         output.getvalue(),
         mimetype="text/csv",
         headers={"Content-Disposition": "attachment; filename=portfolio.csv"},
+    )
+
+
+@app.route("/activity-statement/download")
+def activity_statement_download():
+    if not flex_configured():
+        abort(
+            400,
+            "Set IBKR_FLEX_TOKEN and IBKR_FLEX_QUERY_ID in your environment. "
+            "Create an Activity Flex Query in IBKR Client Portal under Reporting > Flex Queries.",
+        )
+
+    try:
+        content = fetch_flex_activity_statement(FLEX_TOKEN, FLEX_QUERY_ID)
+    except requests.RequestException as exc:
+        abort(502, f"Could not reach IBKR Flex Web Service: {exc}")
+    except RuntimeError as exc:
+        abort(502, str(exc))
+
+    filename, mimetype = flex_download_filename(content)
+    return Response(
+        content,
+        mimetype=mimetype,
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
     )
 
 

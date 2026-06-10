@@ -4,8 +4,8 @@ services:
     build: .
     image: ibkr-rest-api
     container_name: ibkr
-    environment:
-      IBKR_ACCOUNT_ID: "U9862760"
+    env_file:
+      - .env
     ports:
       - "5055:5055"
       - "5056:5056"
