@@ -1,5 +1,10 @@
-import requests, time, os, random
-from flask import Flask, render_template, request, redirect
+import csv
+import io
+import requests
+import time
+import os
+import random
+from flask import Flask, render_template, request, redirect, Response
 
 # disable warnings until you install a certificate
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
@@ -114,6 +119,46 @@ def portfolio():
 
     # return my positions, how much cash i have in this account
     return render_template("portfolio.html", positions=positions)
+
+
+@app.route("/portfolio/csv")
+def portfolio_csv():
+    r = requests.get(f"{BASE_API_URL}/portfolio/{ACCOUNT_ID}/positions/0", verify=False)
+
+    if r.content:
+        positions = r.json()
+    else:
+        positions = []
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+
+    headers = [
+        "Contract ID", "Name", "Contract Description",
+        "Quantity", "Average Cost", "Market Price", "Market Value",
+        "Unrealized P/L"
+    ]
+    writer.writerow(headers)
+
+    for item in positions:
+        writer.writerow([
+            item.get("conid", ""),
+            item.get("name", ""),
+            item.get("contractDesc", ""),
+            item.get("position", ""),
+            item.get("avgCost", ""),
+            item.get("mktPrice", ""),
+            item.get("mktValue", ""),
+            item.get("unrealizedPnl", ""),
+        ])
+
+    output.seek(0)
+    return Response(
+        output.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment; filename=portfolio.csv"},
+    )
+
 
 @app.route("/watchlists")
 def watchlists():
